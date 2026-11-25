@@ -5,6 +5,7 @@
 ![PySpark](https://img.shields.io/badge/PySpark-4.0-E25A1C?logo=apachespark&logoColor=white)
 ![Delta Lake](https://img.shields.io/badge/Delta%20Lake-medallion-00ADD4)
 ![Power BI](https://img.shields.io/badge/Power%20BI-report-F2C811?logo=powerbi&logoColor=black)
+![Great Expectations](https://img.shields.io/badge/Great%20Expectations-validation-FF6310)
 
 An end-to-end data engineering project: a **medallion lakehouse (Bronze / Silver / Gold)** built with **PySpark and Delta Lake** on **Databricks Free Edition**, orchestrated with a **Databricks Job**, protected by a **data quality gate**, covered by **pytest unit tests and GitHub Actions CI**, and delivered through a **Databricks AI/BI dashboard** and a **Power BI report**.
 
@@ -23,6 +24,7 @@ It processes the public [Olist Brazilian e-commerce dataset](https://www.kaggle.
 | Data cleaning, quality rules, quarantine, `MERGE` upserts | [`notebooks/02_silver_transformation.py`](notebooks/02_silver_transformation.py) and [`notebooks/olist_transforms.py`](notebooks/olist_transforms.py) |
 | The dimensional model (star schema) | [`notebooks/03_gold_star_schema.py`](notebooks/03_gold_star_schema.py) |
 | Run logging and the quality gate | [`notebooks/04_pipeline_summary.py`](notebooks/04_pipeline_summary.py) |
+| Data validation with Great Expectations (critical vs warning checks, results table) | [`notebooks/02b_validate_silver_gx.py`](notebooks/02b_validate_silver_gx.py) and [`notebooks/dq_expectations.py`](notebooks/dq_expectations.py) |
 | Delta Lake features (time travel, restore, constraints, optimize) | [`notebooks/05_delta_features_demo.py`](notebooks/05_delta_features_demo.py) |
 | Unit tests and CI | [`tests/`](tests/) and [`.github/workflows/ci.yml`](.github/workflows/ci.yml) |
 | The business results | [Dashboards](#8-dashboards) and [Key findings](#9-key-findings) |
@@ -34,6 +36,7 @@ It processes the public [Olist Brazilian e-commerce dataset](https://www.kaggle.
 - Delta Lake `MERGE INTO` upserts, time travel, `RESTORE`, `CHECK` constraints and `OPTIMIZE`
 - Dimensional modeling: 4 dimensions, 2 fact tables and 5 aggregate tables
 - Orchestration with task dependencies, job parameters, run logging and a quality gate that fails the run on bad data
+- Automated data validation with **Great Expectations** between Silver and Gold: critical failures stop the Job, warnings are logged, every result is stored in `ops.dq_results`
 - Testable pipeline code: the cleaning logic is shared between the pipeline and the unit tests
 - BI delivery: Databricks AI/BI dashboard and a 3-page Power BI report built on the same Gold model
 
@@ -46,6 +49,7 @@ It processes the public [Olist Brazilian e-commerce dataset](https://www.kaggle.
 3. [Dataset](#3-dataset)
 4. [Layer details](#4-layer-details)
 5. [Orchestration and observability](#5-orchestration-and-observability)
+   - [Data validation with Great Expectations](#data-validation-with-great-expectations)
 6. [Delta Lake features demonstrated](#6-delta-lake-features-demonstrated)
 7. [Testing and CI](#7-testing-and-ci)
 8. [Dashboards](#8-dashboards)
@@ -96,11 +100,11 @@ flowchart LR
 | Gold | `workspace.gold` | Star schema and business aggregates | Full rebuild from Silver |
 | Ops | `workspace.ops` | Row counts per layer and quality gate results per run | Append |
 
-**Orchestration:** one Databricks Job with four dependent tasks.
+**Orchestration:** one Databricks Job with five dependent tasks.
 
 ```mermaid
 flowchart LR
-    bronze --> silver --> gold --> quality_gate
+    bronze --> silver --> validate_silver --> gold --> quality_gate
 ```
 
 ---
@@ -182,7 +186,7 @@ Business definitions: a **valid sale** is an order that is not `canceled` or `un
 
 ## 5. Orchestration and observability
 
-The Databricks Job `olist_lakehouse_pipeline` ([definition](jobs/olist_pipeline_job.yml)) runs four notebook tasks on serverless compute: `bronze` then `silver` then `gold` then `quality_gate`. It takes about 6 minutes in Free Edition. A failed task stops everything downstream, so Gold is never rebuilt on bad Silver data.
+The Databricks Job `olist_lakehouse_pipeline` ([definition](jobs/olist_pipeline_job.yml)) runs five notebook tasks on serverless compute: `bronze` then `silver` then `validate_silver` then `gold` then `quality_gate`. It takes about 8 minutes in Free Edition. A failed task stops everything downstream, so Gold is never rebuilt on bad Silver data.
 
 **Job parameters:** `batch` (default `all`) and `run_id` (`{{job.run_id}}`).
 
@@ -203,6 +207,21 @@ The Databricks Job `olist_lakehouse_pipeline` ([definition](jobs/olist_pipeline_
 
 **Idempotency:** the whole Job can be re-run safely. Bronze skips loaded batches, Silver updates instead of inserting, Gold is rebuilt, and row counts stay the same.
 
+### Data validation with Great Expectations
+
+After Silver is built and before Gold is rebuilt, the Job runs a `validate_silver` task ([`02b_validate_silver_gx.py`](notebooks/02b_validate_silver_gx.py)). It validates every Silver table with the expectation suites in [`dq_expectations.py`](notebooks/dq_expectations.py): not-null and unique keys (including compound keys), accepted values, numeric ranges, GPS bounds and row-count floors. 40 expectations run on the Silver tables.
+
+```mermaid
+flowchart LR
+    bronze --> silver --> validate_silver --> gold --> quality_gate
+```
+
+- **Critical** expectations stop the Job, so Gold is never built on bad Silver data. **Warning** expectations (for example an unusually high price) are only logged
+- Every result is stored in `ops.dq_results` (one row per expectation per run, tied to the Job `run_id`), so data quality can be tracked over time
+- Great Expectations runs directly on Spark DataFrames on serverless compute, with an automatic pandas fallback if that is not available
+- The suites are unit tested with deliberately bad data (duplicate keys, unknown statuses, negative prices, review scores out of range, GPS points outside Brazil) in [`tests/test_dq_expectations.py`](tests/test_dq_expectations.py), and run in CI
+- Quarantine and Great Expectations complement each other: quarantine removes bad rows on the way into Silver, and Great Expectations proves the result is clean and fails loudly if anything slips through. The final quality gate still checks cross-layer reconciliation, which Great Expectations is not designed for
+
 ---
 
 ## 6. Delta Lake features demonstrated
@@ -222,6 +241,7 @@ Partitioning is deliberately not used: the tables are small, and partitioning sm
 ## 7. Testing and CI
 
 - **18 pytest unit tests** ([`tests/test_silver_transforms.py`](tests/test_silver_transforms.py)) run the real Silver logic on small synthetic DataFrames: type casting, text standardization, every category of quality rule (invalid status, unparseable dates, negative prices, review scores outside 1 to 5, GPS points outside Brazil), quarantine content, deduplication with single and composite keys, the geolocation aggregation, and the rule engine itself
+- **8 additional pytest tests** ([`tests/test_dq_expectations.py`](tests/test_dq_expectations.py)) check the Great Expectations suites: clean data passes, and each kind of bad data (duplicate key, null key, unknown status, negative price, review score out of range, GPS outside Brazil) is caught
 - The deduplication tests matter because the real Olist data contains no duplicates, so that logic is proven by the tests rather than by the data
 - **GitHub Actions** ([`ci.yml`](.github/workflows/ci.yml)) runs on every push and pull request: Java 17, Python 3.11, PySpark 4.0, syntax check of all notebooks, then the unit tests
 - Gold logic and Delta writes are verified at run time by the quality gate in the Job, not by unit tests
@@ -293,6 +313,8 @@ olist-lakehouse-databricks/
 │   ├── 01_bronze_ingestion.py    # raw ingestion, idempotent, metadata columns
 │   ├── olist_transforms.py       # shared Silver logic (loaded with %run, imported by tests)
 │   ├── 02_silver_transformation.py   # cleaning, quality rules, quarantine, MERGE
+│   ├── 02b_validate_silver_gx.py # Great Expectations validation of Silver (Job task)
+│   ├── dq_expectations.py        # shared Great Expectations suites (loaded with %run, imported by tests)
 │   ├── 03_gold_star_schema.py    # dimensions, facts, aggregates, reconciliation checks
 │   ├── 04_pipeline_summary.py    # run log and quality gate
 │   ├── 05_delta_features_demo.py # time travel, restore, constraints, optimize
@@ -302,6 +324,7 @@ olist-lakehouse-databricks/
 │   └── olist_pipeline_job.yml    # the Databricks Job definition
 ├── tests/
 │   ├── conftest.py
+│   ├── test_dq_expectations.py
 │   └── test_silver_transforms.py
 ├── powerbi/                      # Power BI report
 └── docs/                         # screenshots
@@ -327,7 +350,8 @@ The notebooks are exported in Databricks source format (`.py` with `# COMMAND --
 4. **Create the schemas and the Volume.** Run the setup cell in `00_setup_and_check`: it creates the `landing`, `bronze`, `silver` and `gold` schemas and the Volume `workspace.landing.raw`.
 5. **Upload the files.** In Catalog, open `workspace.landing.raw`, create the directories `static`, `batch_1`, `batch_2` and `batch_3`, and upload the matching files from `upload/`.
 6. **Run the pipeline**, either:
-   - **As a Job (recommended):** create a Job with four notebook tasks (`bronze`, `silver`, `gold`, `quality_gate`) as defined in [`jobs/olist_pipeline_job.yml`](jobs/olist_pipeline_job.yml) (replace `<your-email>` in the notebook paths), with job parameters `batch = all` and `run_id = {{job.run_id}}`, and click Run now.
+   - **As a Job (recommended):** create a Job with five notebook tasks (`bronze`, `silver`, `validate_silver`, `gold`, `quality_gate`) as defined in [`jobs/olist_pipeline_job.yml`](jobs/olist_pipeline_job.yml) (replace `<your-email>` in the notebook paths), with job parameters `batch = all` and `run_id = {{job.run_id}}`, and click Run now.
+     The `validate_silver` task runs the notebook `02b_validate_silver_gx`, depends on `silver`, and `gold` depends on it. Place `dq_expectations` in the same Workspace folder, next to `02b_validate_silver_gx`.
    - **Manually:** run `01_bronze_ingestion`, `02_silver_transformation`, `03_gold_star_schema` and `04_pipeline_summary` in order. For the first two, set the `batch` widget to `static`, `batch_1`, `batch_2` and `batch_3` one at a time, or to `all`.
 7. **Check the results.** The check cells at the bottom of each notebook, and the `ops` schema, show row counts, reconciliation and the quality gate results. Expected totals are listed in [Dataset](#3-dataset) and [Gold](#gold-star-schema-03_gold_star_schemapy).
 
@@ -389,6 +413,7 @@ The notebooks are exported in Databricks source format (`.py` with `# COMMAND --
 | Delta Lake (`MERGE`, time travel, restore, constraints, optimize) | Silver, Delta demo |
 | Medallion architecture and incremental ingestion | Bronze, Silver |
 | Data quality, validation and quarantine | Silver, quality gate |
+| Automated data validation (Great Expectations suites, severity levels, results table) | `validate_silver` task, `ops.dq_results` |
 | Dimensional modeling (star schema, fact grain, aggregates) | Gold |
 | Orchestration and observability (Jobs, parameters, run logs) | Job, `ops` schema |
 | Testing and CI/CD (pytest, GitHub Actions) | `tests/`, `.github/workflows` |
